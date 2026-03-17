@@ -60,7 +60,8 @@ final class JSONMonitor: ObservableObject {
 
             let style = IndentStyle(rawValue: indentStyle) ?? .two
             if style != .two {
-                str = str.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+                let lines = str.components(separatedBy: "\n")
+                str = lines.map { line in
                     let spaces = line.prefix(while: { $0 == " " }).count
                     let indentCount = spaces / 2
                     return String(repeating: style.indent, count: indentCount) + line.dropFirst(spaces)
