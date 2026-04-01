@@ -86,6 +86,53 @@ enum ColorPreset: String, CaseIterable {
     case tokyoNight = "Tokyo Night"
 }
 
+// MARK: - Diff Models
+
+enum DiffState: Equatable {
+    case idle
+    case identical
+    case differences
+    case error(String)
+}
+
+enum DiffType: String {
+    case added   = "Added"
+    case removed = "Removed"
+    case changed = "Changed"
+
+    var icon: String {
+        switch self {
+        case .added:   return "plus.circle.fill"
+        case .removed: return "minus.circle.fill"
+        case .changed: return "arrow.triangle.2.circlepath.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .added:   return .green
+        case .removed: return .red
+        case .changed: return .orange
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .added:   return "RIGHT only"
+        case .removed: return "LEFT only"
+        case .changed: return "Changed"
+        }
+    }
+}
+
+struct DiffEntry: Identifiable {
+    let id = UUID()
+    let type: DiffType
+    let path: String
+    let leftValue: String?
+    let rightValue: String?
+}
+
 // MARK: - ViewModel
 
 final class JSONMonitor: ObservableObject {
@@ -98,6 +145,8 @@ final class JSONMonitor: ObservableObject {
     @Published var compareLeft:     String  = ""
     @Published var compareRight:    String  = ""
     @Published var compareResult:   String  = ""
+    @Published var diffEntries:     [DiffEntry] = []
+    @Published var diffState:       DiffState = .idle
 
     @Published var updateStatus:    String  = ""
     @Published var isCheckingUpdate: Bool   = false
@@ -202,25 +251,49 @@ final class JSONMonitor: ObservableObject {
     func compareJSONs() {
         guard !compareLeft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !compareRight.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            compareResult = "Both JSON inputs required"; return
+            diffState = .error("Both JSON inputs are required"); diffEntries = []; compareResult = ""; return
         }
         let cleanedLeft  = stripComments(from: compareLeft)
         let cleanedRight = stripComments(from: compareRight)
         guard let leftData  = cleanedLeft.data(using: .utf8),
               let rightData = cleanedRight.data(using: .utf8) else {
-            compareResult = "Invalid encoding"; return
+            diffState = .error("Invalid encoding"); diffEntries = []; compareResult = ""; return
         }
         do {
             let leftObj  = try JSONSerialization.jsonObject(with: leftData)
             let rightObj = try JSONSerialization.jsonObject(with: rightData)
             if formatForComparison(leftObj) == formatForComparison(rightObj) {
-                compareResult = "✓ JSONs are identical"
+                diffState = .identical; diffEntries = []; compareResult = ""
             } else {
-                compareResult = "≠ Differences:\n\(findDifferences(leftObj, rightObj))"
+                var entries: [DiffEntry] = []
+                collectDiffEntries(leftObj, rightObj, path: "$", entries: &entries)
+                diffEntries = entries
+                diffState = .differences
+                compareResult = entries.map { e in
+                    switch e.type {
+                    case .added:   return "+ \(e.path): \(e.rightValue ?? "")"
+                    case .removed: return "- \(e.path): \(e.leftValue ?? "")"
+                    case .changed: return "~ \(e.path): \(e.leftValue ?? "") → \(e.rightValue ?? "")"
+                    }
+                }.joined(separator: "\n")
             }
         } catch {
-            compareResult = "✗ Parse error"
+            diffState = .error("Invalid JSON — check syntax in both panels"); diffEntries = []; compareResult = ""
         }
+    }
+
+    func swapCompareInputs() {
+        let tmp = compareLeft; compareLeft = compareRight; compareRight = tmp
+        if diffState != .idle { compareJSONs() }
+    }
+
+    func clearCompare() {
+        compareLeft = ""; compareRight = ""; compareResult = ""; diffEntries = []; diffState = .idle
+    }
+
+    func copyCompareResult() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(compareResult, forType: .string)
     }
 
     private func formatForComparison(_ obj: Any) -> String {
@@ -229,45 +302,49 @@ final class JSONMonitor: ObservableObject {
         return str
     }
 
-    private func findDifferences(_ left: Any, _ right: Any) -> String {
-        var diffs: [String] = []
-        collectDifferences(left, right, path: "", diffs: &diffs)
-        return diffs.isEmpty ? "No differences" : diffs.prefix(20).joined(separator: "\n")
-    }
-
-    private func collectDifferences(_ left: Any, _ right: Any, path: String, diffs: inout [String]) {
+    private func collectDiffEntries(_ left: Any, _ right: Any, path: String, entries: inout [DiffEntry]) {
         if let leftDict = left as? [String: Any], let rightDict = right as? [String: Any] {
             for key in Set(leftDict.keys).union(rightDict.keys).sorted() {
-                let p = path.isEmpty ? key : "\(path).\(key)"
+                let p = "\(path).\(key)"
                 if leftDict[key] == nil {
-                    diffs.append("+ \(p): only in RIGHT")
+                    entries.append(DiffEntry(type: .added, path: p, leftValue: nil, rightValue: stringify(rightDict[key]!)))
                 } else if rightDict[key] == nil {
-                    diffs.append("- \(p): only in LEFT")
+                    entries.append(DiffEntry(type: .removed, path: p, leftValue: stringify(leftDict[key]!), rightValue: nil))
                 } else {
                     let l = leftDict[key]!, r = rightDict[key]!
                     if !valuesEqual(l, r) {
-                        if l is [String: Any] && r is [String: Any] { collectDifferences(l, r, path: p, diffs: &diffs) }
-                        else if l is [Any] && r is [Any] { collectDifferences(l, r, path: p, diffs: &diffs) }
-                        else { diffs.append("~ \(p): \(stringify(l)) → \(stringify(r))") }
+                        if l is [String: Any] && r is [String: Any] {
+                            collectDiffEntries(l, r, path: p, entries: &entries)
+                        } else if l is [Any] && r is [Any] {
+                            collectDiffEntries(l, r, path: p, entries: &entries)
+                        } else {
+                            entries.append(DiffEntry(type: .changed, path: p, leftValue: stringify(l), rightValue: stringify(r)))
+                        }
                     }
                 }
             }
         } else if let leftArr = left as? [Any], let rightArr = right as? [Any] {
             if leftArr.count != rightArr.count {
-                diffs.append("~ \(path): array length \(leftArr.count) → \(rightArr.count)")
+                entries.append(DiffEntry(type: .changed, path: "\(path).length", leftValue: "\(leftArr.count)", rightValue: "\(rightArr.count)"))
             }
-            for idx in 0..<min(leftArr.count, rightArr.count) {
+            for idx in 0..<max(leftArr.count, rightArr.count) {
                 let p = "\(path)[\(idx)]"
-                if !valuesEqual(leftArr[idx], rightArr[idx]) {
+                if idx >= leftArr.count {
+                    entries.append(DiffEntry(type: .added, path: p, leftValue: nil, rightValue: stringify(rightArr[idx])))
+                } else if idx >= rightArr.count {
+                    entries.append(DiffEntry(type: .removed, path: p, leftValue: stringify(leftArr[idx]), rightValue: nil))
+                } else if !valuesEqual(leftArr[idx], rightArr[idx]) {
                     if leftArr[idx] is [String: Any] && rightArr[idx] is [String: Any] {
-                        collectDifferences(leftArr[idx], rightArr[idx], path: p, diffs: &diffs)
+                        collectDiffEntries(leftArr[idx], rightArr[idx], path: p, entries: &entries)
+                    } else if leftArr[idx] is [Any] && rightArr[idx] is [Any] {
+                        collectDiffEntries(leftArr[idx], rightArr[idx], path: p, entries: &entries)
                     } else {
-                        diffs.append("~ \(p): \(stringify(leftArr[idx])) → \(stringify(rightArr[idx]))")
+                        entries.append(DiffEntry(type: .changed, path: p, leftValue: stringify(leftArr[idx]), rightValue: stringify(rightArr[idx])))
                     }
                 }
             }
         } else {
-            diffs.append("~ \(path): type mismatch")
+            entries.append(DiffEntry(type: .changed, path: path, leftValue: stringify(left), rightValue: stringify(right)))
         }
     }
 
@@ -282,12 +359,14 @@ final class JSONMonitor: ObservableObject {
 
     private func valuesEqual(_ a: Any?, _ b: Any?) -> Bool {
         if a is NSNull && b is NSNull { return true }
-        if a as? String == b as? String { return true }
-        if a as? Int    == b as? Int    { return true }
-        if a as? Double == b as? Double { return true }
-        if a as? Bool   == b as? Bool   { return true }
+        if let aStr = a as? String, let bStr = b as? String { return aStr == bStr }
+        if let aBool = a as? Bool, let bBool = b as? Bool { return aBool == bBool }
+        if let aNum = a as? NSNumber, let bNum = b as? NSNumber { return aNum.isEqual(to: bNum) }
         if let aDict = a as? [String: Any], let bDict = b as? [String: Any] {
             return NSDictionary(dictionary: aDict).isEqual(to: bDict)
+        }
+        if let aArr = a as? [Any], let bArr = b as? [Any] {
+            return NSArray(array: aArr).isEqual(to: bArr)
         }
         return false
     }
@@ -369,150 +448,149 @@ private func makeToolbar(monitor: JSONMonitor) -> some View {
 
 struct JSONEditorView: View {
     @ObservedObject var monitor: JSONMonitor
+    @State private var justPasted = false
 
     var body: some View {
         VStack(spacing: 0) {
             makeToolbar(monitor: monitor)
             Divider()
             GeometryReader { geo in
-                VStack(spacing: 0) {
-                    inputSection(height: (geo.size.height - 88) / 2)
-                    actionBar
-                    Divider()
-                    outputSection(height: (geo.size.height - 88) / 2)
+                HStack(spacing: 0) {
+                    // Left: Input
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack {
+                            Text("INPUT")
+                                .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                if let str = NSPasteboard.general.string(forType: .string) {
+                                    monitor.inputText = str
+                                    justPasted = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { justPasted = false }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: justPasted ? "checkmark.circle.fill" : "doc.on.clipboard")
+                                    Text(justPasted ? "Pasted!" : "Paste")
+                                }
+                                .font(.caption)
+                                .foregroundStyle(justPasted ? .green : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .cursor(.pointingHand)
+                        }
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+
+                        TextEditor(text: $monitor.inputText)
+                            .font(.system(size: 13, design: .monospaced))
+                            .scrollContentBackground(.hidden)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .padding(.horizontal, 16).padding(.bottom, 8)
+                    }
+                    .frame(width: geo.size.width / 2)
+
+                    // Center: Actions
+                    VStack(spacing: 12) {
+                        Spacer()
+
+                        Button { monitor.formatJSON() } label: {
+                            VStack(spacing: 4) {
+                                Image(systemName: "wand.and.stars").font(.title3)
+                                Text("Format").font(.caption2)
+                            }
+                            .frame(width: 56)
+                        }
+                        .buttonStyle(.borderedProminent).controlSize(.regular)
+                        .keyboardShortcut("f", modifiers: [.command])
+
+                        Button { monitor.minifyJSON() } label: {
+                            VStack(spacing: 4) {
+                                Image(systemName: "arrow.down.right.and.arrow.up.left").font(.title3)
+                                Text("Minify").font(.caption2)
+                            }
+                            .frame(width: 56)
+                        }
+                        .buttonStyle(.bordered).controlSize(.regular)
+                        .keyboardShortcut("m", modifiers: [.command])
+
+                        if let err = monitor.errorMessage {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red).font(.caption)
+                                .help(err)
+                        }
+
+                        Spacer()
+                    }
+                    .frame(width: 72)
+
+                    // Right: Output
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack {
+                            Text("OUTPUT")
+                                .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+                            Spacer()
+                            if !monitor.outputText.isEmpty {
+                                Text(monitor.stats).font(.caption2).foregroundStyle(.tertiary)
+                            }
+                        }
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+
+                        TextEditor(text: .constant(monitor.outputText))
+                            .font(.system(size: 13, design: .monospaced))
+                            .scrollContentBackground(.hidden)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .padding(.horizontal, 16).padding(.bottom, 8)
+                    }
+                    .frame(width: geo.size.width / 2 - 72)
                 }
             }
             Divider()
-            bottomBar
-        }
-    }
-
-    private func inputSection(height: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("INPUT")
-                    .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    monitor.pasteFromClipboard()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "doc.on.clipboard")
-                        Text("Paste")
-                    }.font(.caption)
-                }
-                .buttonStyle(.plain)
-                .cursor(.pointingHand)
-            }
-            .padding(.horizontal, 20)
-
-            TextEditor(text: $monitor.inputText)
-                .font(.system(size: 13, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .background(Color(nsColor: .textBackgroundColor))
-                .cornerRadius(8)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
-                .padding(.horizontal, 20)
-        }
-        .frame(height: height)
-    }
-
-    private var actionBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                monitor.formatJSON()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "wand.and.stars")
-                    Text("Format")
-                }.font(.callout).fontWeight(.medium)
-            }
-            .buttonStyle(.borderedProminent).controlSize(.large)
-            .keyboardShortcut("f", modifiers: [.command])
-
-            Button {
-                monitor.minifyJSON()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left")
-                    Text("Minify")
-                }.font(.callout)
-            }
-            .buttonStyle(.bordered).controlSize(.large)
-            .keyboardShortcut("m", modifiers: [.command])
-
-            Spacer()
-
-            if let err = monitor.errorMessage {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                    Text(err)
-                }
-                .font(.caption).foregroundStyle(.red)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(Color.red.opacity(0.1)).cornerRadius(6)
-            }
-        }
-        .padding(.horizontal, 20).padding(.vertical, 12)
-    }
-
-    private func outputSection(height: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("OUTPUT")
-                    .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                Spacer()
+            // Bottom bar
+            HStack(spacing: 12) {
                 if !monitor.outputText.isEmpty {
-                    Text(monitor.stats).font(.caption2).foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.horizontal, 20)
-
-            TextEditor(text: .constant(monitor.outputText))
-                .font(.system(size: 13, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .background(Color(nsColor: .textBackgroundColor))
-                .cornerRadius(8)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
-                .padding(.horizontal, 20)
-        }
-        .frame(height: height)
-    }
-
-    private var bottomBar: some View {
-        HStack {
-            if !monitor.outputText.isEmpty {
-                Button {
-                    monitor.copyOutput()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: monitor.justCopied ? "checkmark.circle.fill" : "doc.on.doc")
-                        Text(monitor.justCopied ? "Copied!" : "Copy Output")
+                    Button {
+                        monitor.copyOutput()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: monitor.justCopied ? "checkmark.circle.fill" : "doc.on.doc")
+                            Text(monitor.justCopied ? "Copied!" : "Copy Output")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(monitor.justCopied ? .green : Color.accentColor)
                     }
-                    .font(.callout)
-                    .foregroundStyle(monitor.justCopied ? .green : Color.accentColor)
+                    .buttonStyle(.plain)
+                    .cursor(.pointingHand)
+                }
+
+                if let err = monitor.errorMessage {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(err)
+                    }
+                    .font(.caption2).foregroundStyle(.red)
+                    .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    monitor.inputText = ""; monitor.outputText = ""; monitor.errorMessage = nil
+                } label: {
+                    HStack(spacing: 4) { Image(systemName: "trash"); Text("Clear") }
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut("k", modifiers: [.command])
                 .cursor(.pointingHand)
-            }
-            Spacer()
-            Button {
-                monitor.inputText = ""; monitor.outputText = ""; monitor.errorMessage = nil
-            } label: {
-                HStack(spacing: 6) { Image(systemName: "trash"); Text("Clear All") }
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut("k", modifiers: [.command])
-            .cursor(.pointingHand)
 
-            Divider().frame(height: 14).padding(.horizontal, 4)
+                Divider().frame(height: 12)
 
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
-                .cursor(.pointingHand)
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
+                    .cursor(.pointingHand)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 8)
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
     }
 }
 
@@ -520,6 +598,17 @@ struct JSONEditorView: View {
 
 struct CompareView: View {
     @ObservedObject var monitor: JSONMonitor
+    @State private var copiedDiff = false
+    @State private var activeFilter: DiffType? = nil
+
+    private var addedCount: Int   { monitor.diffEntries.filter { $0.type == .added }.count }
+    private var removedCount: Int { monitor.diffEntries.filter { $0.type == .removed }.count }
+    private var changedCount: Int { monitor.diffEntries.filter { $0.type == .changed }.count }
+
+    private var filteredEntries: [DiffEntry] {
+        guard let filter = activeFilter else { return monitor.diffEntries }
+        return monitor.diffEntries.filter { $0.type == filter }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -527,15 +616,35 @@ struct CompareView: View {
             Divider()
             GeometryReader { geo in
                 VStack(spacing: 0) {
-                    HStack(spacing: 16) {
-                        editorPanel(label: "LEFT JSON",  text: $monitor.compareLeft)
+                    // Editor panels with swap button
+                    HStack(spacing: 0) {
+                        editorPanel(label: "LEFT JSON", text: $monitor.compareLeft)
+                        VStack {
+                            Spacer()
+                            Button { monitor.swapCompareInputs() } label: {
+                                Image(systemName: "arrow.left.arrow.right")
+                                    .font(.caption).fontWeight(.semibold)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 28, height: 28)
+                                    .background(Color(nsColor: .controlBackgroundColor))
+                                    .cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .cursor(.pointingHand)
+                            .help("Swap left and right")
+                            Spacer()
+                        }
+                        .frame(width: 40)
                         editorPanel(label: "RIGHT JSON", text: $monitor.compareRight)
                     }
-                    .frame(height: geo.size.height * 0.48)
+                    .frame(height: geo.size.height * 0.42)
                     .padding(.horizontal, 20).padding(.top, 12)
 
-                    HStack {
+                    // Action bar
+                    HStack(spacing: 12) {
                         Button {
+                            activeFilter = nil
                             monitor.compareJSONs()
                         } label: {
                             HStack(spacing: 6) {
@@ -545,41 +654,113 @@ struct CompareView: View {
                         }
                         .buttonStyle(.borderedProminent).controlSize(.large)
                         .keyboardShortcut("d", modifiers: [.command])
+
+                        Button {
+                            monitor.clearCompare()
+                            activeFilter = nil
+                            copiedDiff = false
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "trash")
+                                Text("Clear")
+                            }.font(.callout)
+                        }
+                        .buttonStyle(.bordered).controlSize(.large)
+
+                        Spacer()
+
+                        if !monitor.diffEntries.isEmpty {
+                            Button {
+                                monitor.copyCompareResult()
+                                copiedDiff = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copiedDiff = false }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: copiedDiff ? "checkmark.circle.fill" : "doc.on.doc")
+                                    Text(copiedDiff ? "Copied!" : "Copy Diff")
+                                }
+                                .font(.callout)
+                                .foregroundStyle(copiedDiff ? .green : Color.accentColor)
+                            }
+                            .buttonStyle(.plain)
+                            .cursor(.pointingHand)
+                        }
                     }
-                    .padding(.vertical, 12)
+                    .padding(.horizontal, 20).padding(.vertical, 10)
 
                     Divider()
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("DIFFERENCES")
-                            .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                            .padding(.horizontal, 20)
+                    // Results section
+                    VStack(alignment: .leading, spacing: 0) {
+                        if monitor.diffState == .differences {
+                            // Filter bar
+                            HStack(spacing: 8) {
+                                Text("RESULTS").font(.caption).fontWeight(.bold).foregroundStyle(.secondary)
+                                Spacer()
+                                filterBadge(type: nil, label: "All", count: monitor.diffEntries.count, color: .secondary)
+                                if addedCount > 0 {
+                                    filterBadge(type: .added, label: "Added", count: addedCount, color: .green)
+                                }
+                                if removedCount > 0 {
+                                    filterBadge(type: .removed, label: "Removed", count: removedCount, color: .red)
+                                }
+                                if changedCount > 0 {
+                                    filterBadge(type: .changed, label: "Changed", count: changedCount, color: .orange)
+                                }
+                            }
+                            .padding(.horizontal, 20).padding(.vertical, 8)
+                            Divider()
+                        }
+
                         ScrollView {
-                            if monitor.compareResult.isEmpty {
-                                Text("Paste two JSON blobs above, then tap Compare.")
+                            switch monitor.diffState {
+                            case .idle:
+                                Text("Paste two JSON documents above and click Compare.")
                                     .font(.callout).foregroundStyle(.tertiary)
                                     .frame(maxWidth: .infinity, alignment: .center)
                                     .padding(.vertical, 40)
-                            } else {
-                                Text(monitor.compareResult)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(16)
-                                    .background(
-                                        monitor.compareResult.contains("✓") ? Color.green.opacity(0.1) :
-                                        monitor.compareResult.contains("✗") ? Color.red.opacity(0.1) :
-                                        Color.orange.opacity(0.1)
-                                    )
-                                    .cornerRadius(8)
-                                    .padding(.horizontal, 20)
+
+                            case .identical:
+                                HStack(spacing: 8) {
+                                    Image(systemName: "checkmark.seal.fill")
+                                        .foregroundStyle(.green).font(.title2)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("No differences found")
+                                            .font(.callout).fontWeight(.medium)
+                                        Text("Both JSON documents are structurally identical.")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 32)
+
+                            case .error(let msg):
+                                HStack(spacing: 8) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.red).font(.title2)
+                                    Text(msg).font(.callout).foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 32)
+
+                            case .differences:
+                                LazyVStack(alignment: .leading, spacing: 1) {
+                                    ForEach(filteredEntries) { entry in
+                                        diffRow(entry)
+                                    }
+                                }
+                                .padding(.horizontal, 20).padding(.vertical, 8)
                             }
                         }
                     }
                 }
             }
             Divider()
-            // Bottom bar
             HStack {
+                if monitor.diffState == .differences {
+                    Text("\(filteredEntries.count) of \(monitor.diffEntries.count) difference\(monitor.diffEntries.count == 1 ? "" : "s")")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
                     .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
@@ -588,6 +769,83 @@ struct CompareView: View {
             .padding(.horizontal, 20).padding(.vertical, 10)
         }
     }
+
+    // MARK: - Filter badge (clickable)
+
+    private func filterBadge(type: DiffType?, label: String, count: Int, color: Color) -> some View {
+        let isActive = activeFilter == type
+        return Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                activeFilter = (activeFilter == type) ? nil : type
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(count)").fontWeight(.semibold)
+                Text(label)
+            }
+            .font(.caption)
+            .foregroundStyle(isActive ? .white : color)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(isActive ? color : color.opacity(0.12))
+            .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .cursor(.pointingHand)
+    }
+
+    // MARK: - Diff row
+
+    private func diffRow(_ entry: DiffEntry) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: entry.type.icon)
+                .foregroundStyle(entry.type.color)
+                .font(.system(size: 13))
+                .frame(width: 16, alignment: .center)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.path)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+
+                switch entry.type {
+                case .added:
+                    valueLabel("RIGHT", entry.rightValue ?? "", color: .green)
+                case .removed:
+                    valueLabel("LEFT", entry.leftValue ?? "", color: .red)
+                case .changed:
+                    HStack(spacing: 0) {
+                        valueLabel("LEFT", entry.leftValue ?? "", color: .red)
+                        Image(systemName: "arrow.right")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                        valueLabel("RIGHT", entry.rightValue ?? "", color: .green)
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(entry.type.color.opacity(0.04))
+        .cornerRadius(6)
+    }
+
+    private func valueLabel(_ side: String, _ value: String, color: Color) -> some View {
+        HStack(spacing: 4) {
+            Text(side)
+                .font(.system(size: 9, weight: .bold, design: .default))
+                .foregroundStyle(color.opacity(0.8))
+            Text(value)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .background(color.opacity(0.08))
+        .cornerRadius(3)
+    }
+
+    // MARK: - Editor panel
 
     private func editorPanel(label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -614,132 +872,183 @@ struct SettingsView: View {
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                VStack(spacing: 1) {
+                    // Formatting group
+                    sectionHeader("Formatting")
 
-                    // 1 — Formatting
-                    settingSection("Formatting Options") {
-                        VStack(alignment: .leading, spacing: 16) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Indentation Style")
-                                    .font(.callout).fontWeight(.medium)
-                                Picker("", selection: $monitor.indentStyle) {
-                                    ForEach(IndentStyle.allCases, id: \.value) { Text($0.rawValue).tag($0.value) }
-                                }
-                                .pickerStyle(.segmented).labelsHidden()
+                    settingRow {
+                        HStack {
+                            settingLabel("Indentation", icon: "increase.indent", subtitle: nil)
+                            Spacer()
+                            Picker("", selection: $monitor.indentStyle) {
+                                ForEach(IndentStyle.allCases, id: \.value) { Text($0.rawValue).tag($0.value) }
                             }
-                            Toggle(isOn: $monitor.sortKeys) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Sort Keys Alphabetically").font(.callout).fontWeight(.medium)
-                                    Text("Automatically sort JSON object keys").font(.caption2).foregroundStyle(.secondary)
-                                }
-                            }
-                            .toggleStyle(.switch)
+                            .pickerStyle(.segmented).labelsHidden()
+                            .frame(width: 200)
                         }
                     }
 
-                    // 2 — Keyboard Shortcuts
-                    settingSection("Keyboard Shortcuts") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            shortcutRow("Format JSON",  "⌘F")
-                            shortcutRow("Minify JSON",  "⌘M")
-                            shortcutRow("Compare",      "⌘D")
-                            shortcutRow("Clear All",    "⌘K")
-                            shortcutRow("Paste",        "⌘V")
+                    settingRow {
+                        HStack {
+                            settingLabel("Sort Keys", icon: "arrow.up.arrow.down", subtitle: "Alphabetically sort object keys")
+                            Spacer()
+                            Toggle("", isOn: $monitor.sortKeys).toggleStyle(.switch).labelsHidden()
                         }
                     }
 
-                    // 3 — Appearance
-                    settingSection("Appearance") {
-                        VStack(alignment: .leading, spacing: 16) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Theme").font(.callout).fontWeight(.medium)
-                                Picker("", selection: $monitor.appTheme) {
-                                    ForEach(AppTheme.allCases, id: \.rawValue) {
-                                        Text($0.rawValue).tag($0.rawValue.lowercased())
-                                    }
+                    // Appearance group
+                    sectionHeader("Appearance")
+
+                    settingRow {
+                        HStack {
+                            settingLabel("Theme", icon: "circle.lefthalf.filled", subtitle: nil)
+                            Spacer()
+                            Picker("", selection: $monitor.appTheme) {
+                                ForEach(AppTheme.allCases, id: \.rawValue) {
+                                    Text($0.rawValue).tag($0.rawValue.lowercased())
                                 }
-                                .pickerStyle(.segmented).labelsHidden()
                             }
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Color Preset").font(.callout).fontWeight(.medium)
-                                Picker("", selection: $monitor.colorPreset) {
-                                    ForEach(ColorPreset.allCases, id: \.rawValue) {
-                                        Text($0.rawValue).tag($0.rawValue)
-                                    }
-                                }
-                                .pickerStyle(.segmented).labelsHidden()
-                            }
+                            .pickerStyle(.segmented).labelsHidden()
+                            .frame(width: 200)
                         }
                     }
 
-                    // 4 — Updates
-                    settingSection("Updates") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Button(monitor.isCheckingUpdate ? "Checking…" : "Check for Updates") {
+                    settingRow {
+                        HStack {
+                            settingLabel("Color Preset", icon: "paintpalette", subtitle: nil)
+                            Spacer()
+                            Picker("", selection: $monitor.colorPreset) {
+                                ForEach(ColorPreset.allCases, id: \.rawValue) {
+                                    Text($0.rawValue).tag($0.rawValue)
+                                }
+                            }
+                            .pickerStyle(.segmented).labelsHidden()
+                            .frame(width: 200)
+                        }
+                    }
+
+                    // Shortcuts group
+                    sectionHeader("Shortcuts")
+
+                    settingRow {
+                        VStack(spacing: 0) {
+                            shortcutRow("Format JSON",  "⌘F", isLast: false)
+                            shortcutRow("Minify JSON",  "⌘M", isLast: false)
+                            shortcutRow("Compare",      "⌘D", isLast: false)
+                            shortcutRow("Clear All",    "⌘K", isLast: false)
+                            shortcutRow("Paste",        "⌘V", isLast: true)
+                        }
+                    }
+
+                    // About group
+                    sectionHeader("About")
+
+                    settingRow {
+                        HStack(spacing: 12) {
+                            Image(systemName: "curlybraces")
+                                .font(.title2).foregroundStyle(.blue)
+                                .frame(width: 32)
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Text(appName).font(.callout).fontWeight(.semibold)
+                                    Text("v\(appVersion)").font(.caption).foregroundStyle(.tertiary)
+                                }
+                                Text(appTagline)
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                            Link("GitHub", destination: URL(string: "https://github.com/\(githubRepo)")!)
+                                .font(.caption)
+                        }
+                    }
+
+                    settingRow {
+                        HStack {
+                            settingLabel("Updates", icon: "arrow.triangle.2.circlepath", subtitle: monitor.updateStatus.isEmpty ? nil : monitor.updateStatus)
+                            Spacer()
+                            Button(monitor.isCheckingUpdate ? "Checking..." : "Check Now") {
                                 monitor.checkForUpdates()
                             }
+                            .font(.caption)
+                            .buttonStyle(.bordered).controlSize(.small)
                             .disabled(monitor.isCheckingUpdate)
-                            if !monitor.updateStatus.isEmpty {
-                                Text(monitor.updateStatus)
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
                         }
                     }
 
-                    // 5 — About
-                    settingSection("About") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .firstTextBaseline) {
-                                Text("\(appName) v\(appVersion)").font(.callout).fontWeight(.medium)
-                                Spacer()
-                                Link("Changelog ↗",
-                                     destination: URL(string: "https://github.com/\(githubRepo)/commits/main/")!)
-                                    .font(.caption)
-                            }
-                            Text(appTagline)
-                                .font(.caption).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                    settingRow {
+                        HStack {
+                            Image(systemName: "lock.shield")
+                                .font(.caption).foregroundStyle(.green)
+                                .frame(width: 20)
                             Text("All data stored locally. Nothing leaves your Mac.")
                                 .font(.caption2).foregroundStyle(.tertiary)
+                            Spacer()
                         }
                     }
                 }
-                .padding(24)
+                .padding(.horizontal, 20).padding(.vertical, 12)
             }
 
             Divider()
             HStack {
                 Spacer()
-                Button("Quit \(appName)") { NSApplication.shared.terminate(nil) }
-                    .buttonStyle(.bordered).controlSize(.small).foregroundStyle(.secondary)
-                Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain).font(.caption2).foregroundStyle(.tertiary)
+                    .cursor(.pointingHand)
             }
-            .padding(.vertical, 12)
+            .padding(.horizontal, 20).padding(.vertical, 10)
         }
     }
 
-    @ViewBuilder
-    private func settingSection<C: View>(_ title: String, @ViewBuilder content: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.caption).fontWeight(.bold)
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            content()
-                .padding(16)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .cornerRadius(10)
-        }
-    }
+    // MARK: - Setting components
 
-    private func shortcutRow(_ action: String, _ shortcut: String) -> some View {
+    private func sectionHeader(_ title: String) -> some View {
         HStack {
-            Text(action).font(.caption)
+            Text(title)
+                .font(.caption).fontWeight(.bold).foregroundStyle(.secondary)
+                .textCase(.uppercase)
             Spacer()
-            Text(shortcut)
-                .font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
-                .padding(.horizontal, 8).padding(.vertical, 4)
-                .background(Color.secondary.opacity(0.1)).cornerRadius(4)
+        }
+        .padding(.horizontal, 4)
+        .padding(.top, 16).padding(.bottom, 4)
+    }
+
+    private func settingRow<C: View>(@ViewBuilder content: () -> C) -> some View {
+        content()
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .cornerRadius(8)
+    }
+
+    private func settingLabel(_ title: String, icon: String, subtitle: String?) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout)
+                if let sub = subtitle {
+                    Text(sub).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func shortcutRow(_ action: String, _ shortcut: String, isLast: Bool) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(action).font(.caption)
+                Spacer()
+                Text(shortcut)
+                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.1)).cornerRadius(3)
+            }
+            .padding(.vertical, 5)
+            if !isLast {
+                Divider()
+            }
         }
     }
 }
